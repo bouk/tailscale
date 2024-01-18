@@ -433,6 +433,183 @@ func (s *Server) serveLoginAPI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type apiHandler[data any] struct {
+	s *Server
+	w http.ResponseWriter
+	r *http.Request
+
+	// peerAllowed must be set through either invoking
+	//
+	// 1. apiHandler.allPeersAllowed to declare that all peers are allowed
+	//    to execute this handler regardless of peer capabilities
+	//
+	// or 2. apiHandler.restrictPeers to provide a function for evaluating
+	//       a peer's access to this handler.
+	//
+	// A request will fail with error if one of these two functions has not
+	// been invoked first.
+	peerAllowed func(data data, peer peerCapabilities) bool
+}
+
+func newHandler[data any](s *Server, w http.ResponseWriter, r *http.Request) *apiHandler[data] {
+	return &apiHandler[data]{s: s, w: w, r: r}
+}
+
+func (a *apiHandler[data]) allPeersAllowed() *apiHandler[data] {
+	a.peerAllowed = func(_ data, _ peerCapabilities) bool { return true }
+	return a
+}
+
+func (a *apiHandler[data]) restrictPeers(peerAllowed func(data data, peer peerCapabilities) bool) *apiHandler[data] {
+	a.peerAllowed = peerAllowed
+	return a
+}
+
+func (a *apiHandler[data]) retrievePeer() (peerCapabilities, error) {
+	whois, err := a.s.lc.WhoIs(a.r.Context(), a.r.RemoteAddr)
+	if err != nil {
+		return nil, err
+	}
+	peer, err := toPeerCapabilities(whois)
+	if err != nil {
+		return nil, err
+	}
+	return peer, nil
+}
+
+type noBodyData interface{} // empty type, for use from serveAPI for endpoints with empty body
+
+// handle runs the given handler if the source peer satisfies the
+// constraints for running this request.
+//
+// handle is expected for use when `data` type is empty, or set to
+// `noBodyData` in practice. For requests that expect JSON body data
+// to be attached, use handleJSON instead. handle is expected for
+// use when `data` type is empty.
+func (a *apiHandler[data]) handle(h http.HandlerFunc) {
+	peer, err := a.retrievePeer()
+	if err != nil {
+		http.Error(a.w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var body data // not used
+	if !a.peerAllowed(body, peer) {
+		http.Error(a.w, "not allowed", http.StatusUnauthorized)
+		return
+	}
+	h(a.w, a.r)
+}
+
+// handleJSON manages decoding the request's body JSON and passing
+// it on to the provided function if the source peer satisfies the
+// constraints for running this request.
+func (a *apiHandler[data]) handleJSON(h func(ctx context.Context, data data) error) {
+	defer a.r.Body.Close()
+	var body data
+	if err := json.NewDecoder(a.r.Body).Decode(&body); err != nil {
+		http.Error(a.w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	peer, err := a.retrievePeer()
+	if err != nil {
+		http.Error(a.w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !a.peerAllowed(body, peer) {
+		http.Error(a.w, "not allowed", http.StatusUnauthorized)
+		return
+	}
+
+	if err := h(a.r.Context(), body); err != nil {
+		http.Error(a.w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.w.WriteHeader(http.StatusOK)
+}
+
+// serveAPI serves requests for the web client api.
+// It should only be called by Server.ServeHTTP, via Server.apiHandler,
+// which protects the handler using gorilla csrf.
+func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-CSRF-Token", csrf.Token(r))
+	path := strings.TrimPrefix(r.URL.Path, "/api")
+	switch {
+	case path == "/data" && r.Method == httpm.GET:
+		newHandler[noBodyData](s, w, r).
+			allPeersAllowed().
+			handle(s.serveGetNodeData)
+		return
+	case path == "/exit-nodes" && r.Method == httpm.GET:
+		newHandler[noBodyData](s, w, r).
+			allPeersAllowed().
+			handle(s.serveGetExitNodes)
+		return
+	case path == "/routes" && r.Method == httpm.POST:
+		peerAllowed := func(d postRoutesRequest, p peerCapabilities) bool {
+			if d.SetExitNode && !p.canEdit(capFeatureExitNode) {
+				return false
+			} else if d.SetRoutes && !p.canEdit(capFeatureSubnet) {
+				return false
+			}
+			return true
+		}
+		newHandler[postRoutesRequest](s, w, r).
+			restrictPeers(peerAllowed).
+			handleJSON(s.servePostRoutes)
+		return
+	case path == "/device-details-click" && r.Method == httpm.POST:
+		newHandler[noBodyData](s, w, r).
+			allPeersAllowed().
+			handle(s.serveDeviceDetailsClick)
+		return
+	case path == "/local/v0/logout" && r.Method == httpm.POST:
+		peerAllowed := func(_ noBodyData, peer peerCapabilities) bool {
+			return peer.canEdit(capFeatureAccount)
+		}
+		newHandler[noBodyData](s, w, r).
+			restrictPeers(peerAllowed).
+			handle(s.proxyRequestToLocalAPI)
+		return
+	case path == "/local/v0/prefs" && r.Method == httpm.PATCH:
+		peerAllowed := func(data maskedPrefs, peer peerCapabilities) bool {
+			if data.RunSSHSet && !peer.canEdit(capFeatureSSH) {
+				return false
+			}
+			return true
+		}
+		newHandler[maskedPrefs](s, w, r).
+			restrictPeers(peerAllowed).
+			handleJSON(s.serveUpdatePrefs)
+		return
+	case path == "/local/v0/update/check" && r.Method == httpm.GET:
+		newHandler[noBodyData](s, w, r).
+			allPeersAllowed().
+			handle(s.proxyRequestToLocalAPI)
+		return
+	case path == "/local/v0/update/check" && r.Method == httpm.POST:
+		peerAllowed := func(_ noBodyData, peer peerCapabilities) bool {
+			return peer.canEdit(capFeatureAccount)
+		}
+		newHandler[noBodyData](s, w, r).
+			restrictPeers(peerAllowed).
+			handle(s.proxyRequestToLocalAPI)
+		return
+	case path == "/local/v0/update/progress" && r.Method == httpm.POST:
+		newHandler[noBodyData](s, w, r).
+			allPeersAllowed().
+			handle(s.proxyRequestToLocalAPI)
+		return
+	case path == "/local/v0/upload-client-metrics" && r.Method == httpm.POST:
+		newHandler[noBodyData](s, w, r).
+			allPeersAllowed().
+			handle(s.proxyRequestToLocalAPI)
+		return
+	}
+	http.Error(w, "invalid endpoint", http.StatusNotFound)
+}
+
+// TODO(soniaappasamy): add tests
+
 type authType string
 
 var (
@@ -604,32 +781,6 @@ func (s *Server) serveAPIAuthSessionWait(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
-}
-
-// serveAPI serves requests for the web client api.
-// It should only be called by Server.ServeHTTP, via Server.apiHandler,
-// which protects the handler using gorilla csrf.
-func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("X-CSRF-Token", csrf.Token(r))
-	path := strings.TrimPrefix(r.URL.Path, "/api")
-	switch {
-	case path == "/data" && r.Method == httpm.GET:
-		s.serveGetNodeData(w, r)
-		return
-	case path == "/exit-nodes" && r.Method == httpm.GET:
-		s.serveGetExitNodes(w, r)
-		return
-	case path == "/routes" && r.Method == httpm.POST:
-		s.servePostRoutes(w, r)
-		return
-	case path == "/device-details-click" && r.Method == httpm.POST:
-		s.serveDeviceDetailsClick(w, r)
-		return
-	case strings.HasPrefix(path, "/local/"):
-		s.proxyRequestToLocalAPI(w, r)
-		return
-	}
-	http.Error(w, "invalid endpoint", http.StatusNotFound)
 }
 
 type nodeData struct {
@@ -868,6 +1019,23 @@ func (s *Server) serveGetExitNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, exitNodes)
 }
 
+// maskedPrefs is the subset of ipn.MaskedPrefs that are
+// allowed to be editable via the web UI.
+type maskedPrefs struct {
+	RunSSHSet bool
+	RunSSH    bool
+}
+
+func (s *Server) serveUpdatePrefs(ctx context.Context, prefs maskedPrefs) error {
+	_, err := s.lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		RunSSHSet: prefs.RunSSHSet,
+		Prefs: ipn.Prefs{
+			RunSSH: prefs.RunSSH,
+		},
+	})
+	return err
+}
+
 type postRoutesRequest struct {
 	SetExitNode       bool // when set, UseExitNode and AdvertiseExitNode values are applied
 	SetRoutes         bool // when set, AdvertiseRoutes value is applied
@@ -876,18 +1044,10 @@ type postRoutesRequest struct {
 	AdvertiseRoutes   []string
 }
 
-func (s *Server) servePostRoutes(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-
-	var data postRoutesRequest
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	prefs, err := s.lc.GetPrefs(r.Context())
+func (s *Server) servePostRoutes(ctx context.Context, data postRoutesRequest) error {
+	prefs, err := s.lc.GetPrefs(ctx)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
 	var currNonExitRoutes []string
 	var currAdvertisingExitNode bool
@@ -910,8 +1070,7 @@ func (s *Server) servePostRoutes(w http.ResponseWriter, r *http.Request) {
 	routesStr := strings.Join(data.AdvertiseRoutes, ",")
 	routes, err := netutil.CalcAdvertiseRoutes(routesStr, data.AdvertiseExitNode)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
 
 	hasExitNodeRoute := func(all []netip.Prefix) bool {
@@ -920,8 +1079,7 @@ func (s *Server) servePostRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !data.UseExitNode.IsZero() && hasExitNodeRoute(routes) {
-		http.Error(w, "cannot use and advertise exit node at same time", http.StatusBadRequest)
-		return
+		return errors.New("cannot use and advertise exit node at same time")
 	}
 
 	// Make prefs update.
@@ -933,12 +1091,8 @@ func (s *Server) servePostRoutes(w http.ResponseWriter, r *http.Request) {
 			AdvertiseRoutes: routes,
 		},
 	}
-	if _, err := s.lc.EditPrefs(r.Context(), p); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
+	_, err = s.lc.EditPrefs(ctx, p)
+	return err
 }
 
 // tailscaleUp starts the daemon with the provided options.
@@ -1077,9 +1231,6 @@ func (s *Server) serveDeviceDetailsClick(w http.ResponseWriter, r *http.Request)
 //
 // The web API request path is expected to exactly match a localapi path,
 // with prefix /api/local/ rather than /localapi/.
-//
-// If the localapi path is not included in localapiAllowlist,
-// the request is rejected.
 func (s *Server) proxyRequestToLocalAPI(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/local")
 	if r.URL.Path == path { // missing prefix
@@ -1092,10 +1243,6 @@ func (s *Server) proxyRequestToLocalAPI(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-	}
-	if !slices.Contains(localapiAllowlist, path) {
-		http.Error(w, fmt.Sprintf("%s not allowed from localapi proxy", path), http.StatusForbidden)
-		return
 	}
 
 	localAPIURL := "http://" + apitype.LocalAPIHost + "/localapi" + path
@@ -1119,21 +1266,6 @@ func (s *Server) proxyRequestToLocalAPI(w http.ResponseWriter, r *http.Request) 
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-}
-
-// localapiAllowlist is an allowlist of localapi endpoints the
-// web client is allowed to proxy to the client's localapi.
-//
-// Rather than exposing all localapi endpoints over the proxy,
-// this limits to just the ones actually used from the web
-// client frontend.
-var localapiAllowlist = []string{
-	"/v0/logout",
-	"/v0/prefs",
-	"/v0/update/check",
-	"/v0/update/install",
-	"/v0/update/progress",
-	"/v0/upload-client-metrics",
 }
 
 // csrfKey returns a key that can be used for CSRF protection.
